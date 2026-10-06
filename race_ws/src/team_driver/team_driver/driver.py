@@ -54,12 +54,12 @@ class Driver(Node):
         super().__init__('driver')
 
         # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
+        # ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
         # Add your own as you go; config/driver_params.yaml loads them.
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 1.0)        # [m/s]
+        self.declare_parameter('crawl_speed', 2.8)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
@@ -144,7 +144,105 @@ class Driver(Node):
         running a policy you trained. See docs/04-algorithms.md for the
         approaches and what each one needs.
         """
-        return 0.0, self.crawl_speed
+        # Only consider the forward 180-degree field of view.
+        front_mask = np.abs(angles) <= (math.pi / 2)
+
+        front_ranges = ranges[front_mask]
+        front_angles = angles[front_mask]
+
+        # Temporary tuning value for this experiment.
+        # A beam is considered usable only if it has at least this much clearance.
+        safe_distance = 1.5  # [m]
+
+        safe = front_ranges > safe_distance
+
+        # Find contiguous True regions in the safe/unsafe mask.
+        padded = np.concatenate(([False], safe, [False]))
+        changes = np.diff(padded.astype(np.int8))
+
+        gap_starts = np.where(changes == 1)[0]
+        gap_ends = np.where(changes == -1)[0]  # end is exclusive
+
+        if len(gap_starts) == 0:
+            # No safe forward gap: stop rather than blindly drive into an obstacle.
+            return 0.0, 0.0
+
+        gap_widths = gap_ends - gap_starts
+        best_gap = np.argmax(gap_widths)
+
+        gap_start = gap_starts[best_gap]
+        gap_end = gap_ends[best_gap]
+
+        # Aim at the angular centre of the widest safe gap.
+        target_index = (gap_start + gap_end - 1) // 2
+        target_angle = front_angles[target_index]
+
+        # Do not command the full target angle directly.
+        steering = 0.5 * target_angle
+
+        # Respect the simulator steering limit with some margin.
+        steering = np.clip(steering, -0.35, 0.35)
+
+        # Reduce speed when the required direction becomes aggressive.
+        # Keep full speed on straights and progressively slow for turns.
+        target_deg_abs = abs(math.degrees(target_angle))
+
+        if target_deg_abs <= 10.0:
+            speed = self.crawl_speed
+
+        elif target_deg_abs >= 30.0:
+            speed = 2.6
+
+        else:
+            # Linear interpolation from crawl_speed at 10 deg
+            # to 2.5 m/s at 30 deg.
+            alpha = (target_deg_abs - 10.0) / 20.0
+            speed = (
+                self.crawl_speed
+                + alpha * (2.6 - self.crawl_speed)
+            )
+
+        if self._marker_divisor == 0:
+            target_deg = math.degrees(target_angle)
+
+            self.get_logger().info(
+                f'gap_width={gap_widths[best_gap]} beams, '
+                f'target={target_deg:+.1f} deg, '
+                f'steer={math.degrees(float(steering)):+.1f} deg'
+            )
+
+            # Diagnostic only:
+            # When the chosen direction suddenly points far sideways,
+            # print every candidate safe gap so we can understand why.
+            if abs(target_deg) > 45.0:
+                gap_info = []
+
+                for i, (start, end, width) in enumerate(
+                    zip(gap_starts, gap_ends, gap_widths)
+                ):
+                    centre_index = (start + end - 1) // 2
+
+                    centre_deg = math.degrees(front_angles[centre_index])
+                    start_deg = math.degrees(front_angles[start])
+                    end_deg = math.degrees(front_angles[end - 1])
+
+                    chosen = "*" if i == best_gap else " "
+
+                    gap_info.append(
+                        f'{chosen}gap{i}: '
+                        f'width={int(width)}, '
+                        f'centre={centre_deg:+.1f}deg, '
+                        f'span=[{start_deg:+.1f},{end_deg:+.1f}]'
+                    )
+
+                self.get_logger().info(
+                    f'gap_width={gap_widths[best_gap]} beams, '
+                    f'target={math.degrees(target_angle):+.1f} deg, '
+                    f'steer={math.degrees(float(steering)):+.1f} deg, '
+                    f'speed={speed:.2f} m/s'
+                )
+
+        return steering, speed
 
     # ------------------------------------------------------------------
     # Output
