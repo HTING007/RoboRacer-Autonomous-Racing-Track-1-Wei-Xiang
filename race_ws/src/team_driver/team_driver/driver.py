@@ -59,7 +59,7 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 2.8)        # [m/s]
+        self.declare_parameter('crawl_speed', 2.85)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
@@ -191,15 +191,15 @@ class Driver(Node):
             speed = self.crawl_speed
 
         elif target_deg_abs >= 30.0:
-            speed = 2.6
+            speed = 2.65
 
         else:
             # Linear interpolation from crawl_speed at 10 deg
-            # to 2.5 m/s at 30 deg.
+            # to 2.65 m/s at 30 deg.
             alpha = (target_deg_abs - 10.0) / 20.0
             speed = (
                 self.crawl_speed
-                + alpha * (2.6 - self.crawl_speed)
+                + alpha * (2.65 - self.crawl_speed)
             )
 
         if self._marker_divisor == 0:
