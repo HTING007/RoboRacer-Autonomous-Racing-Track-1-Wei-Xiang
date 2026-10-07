@@ -38,9 +38,11 @@ What you publish:
 """
 
 import math
+import os
 
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -61,15 +63,55 @@ class Driver(Node):
         self.declare_parameter('drive_topic', '/drive')
         self.declare_parameter('crawl_speed', 2.85)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
+        self.declare_parameter('lookahead_distance', 0.9)   # [m]
+        self.declare_parameter('wheelbase', 0.33)           # [m]
+        self.declare_parameter('pure_pursuit_speed', 2.8)   # [m/s]
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
         self.max_range = self.get_parameter('max_range').value
+        self.lookahead_distance = self.get_parameter('lookahead_distance').value
+        self.wheelbase = self.get_parameter('wheelbase').value
+        self.pure_pursuit_speed = self.get_parameter('pure_pursuit_speed').value
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
         self.position = None      # (x, y) in the map frame
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
+
+        # Load the map-derived shortest legal route installed with this package.
+        self.route = None
+
+        try:
+            package_share = get_package_share_directory('team_driver')
+            route_path = os.path.join(
+                package_share,
+                'config',
+                'icra26_shortest_clear45.csv',
+            )
+
+            route = np.loadtxt(
+                route_path,
+                delimiter=',',
+                comments='#',
+                dtype=np.float64,
+            )
+
+            if route.ndim != 2 or route.shape[1] < 2:
+                raise ValueError('route CSV must contain x,y columns')
+
+            self.route = route[:, :2]
+
+            self.get_logger().info(
+                f'Loaded Pure Pursuit route: '
+                f'{len(self.route)} points from {route_path}'
+            )
+
+        except Exception as exc:
+            self.get_logger().error(
+                f'Could not load Pure Pursuit route: {exc}. '
+                f'Falling back to Follow-the-Gap.'
+            )
 
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
@@ -107,6 +149,14 @@ class Driver(Node):
         if self._marker_divisor == 0:
             self.publish_marker(steering)
 
+            if getattr(self, 'position', None) is not None:
+                x, y = self.position
+                self.get_logger().info(
+                    f'POSE x={x:.2f}, y={y:.2f}, '
+                    f'yaw={math.degrees(self.yaw):+.1f} deg, '
+                    f'speed={self.speed:.2f} m/s'
+                )
+
     def preprocess(self, scan):
         """Turn a raw scan into clean ranges plus the angle of each beam.
 
@@ -125,6 +175,143 @@ class Driver(Node):
     # THIS IS THE PART YOU WRITE.
     # ==================================================================
     def plan(self, ranges, angles):
+        """Primary planner: Pure Pursuit with Follow-the-Gap fallback."""
+
+        if self.position is not None and self.route is not None:
+            result = self.plan_pure_pursuit()
+
+            if result is not None:
+                return result
+
+        # Safety fallback if pose/route/target is unavailable.
+        return self.plan_gap(ranges, angles)
+
+
+    def plan_pure_pursuit(self):
+        """Track the precomputed closed route using Pure Pursuit."""
+
+        if self.position is None or self.route is None:
+            return None
+
+        x, y = self.position
+        n = len(self.route)
+
+        if n < 2:
+            return None
+
+        # --------------------------------------------------------------
+        # 1. Find the route point closest to the current car position.
+        # --------------------------------------------------------------
+        dx_all = self.route[:, 0] - x
+        dy_all = self.route[:, 1] - y
+        dist_sq = dx_all * dx_all + dy_all * dy_all
+
+        nearest_index = int(np.argmin(dist_sq))
+
+        # --------------------------------------------------------------
+        # 2. Walk forward along the route until the lookahead distance
+        #    has been reached.
+        #
+        #    The CSV is a closed loop, so wrap around at the end.
+        # --------------------------------------------------------------
+        accumulated = 0.0
+        current_index = nearest_index
+        target_index = None
+
+        cos_yaw = math.cos(self.yaw)
+        sin_yaw = math.sin(self.yaw)
+
+        for _ in range(n):
+            next_index = (current_index + 1) % n
+
+            segment_dx = (
+                self.route[next_index, 0]
+                - self.route[current_index, 0]
+            )
+            segment_dy = (
+                self.route[next_index, 1]
+                - self.route[current_index, 1]
+            )
+
+            accumulated += math.hypot(segment_dx, segment_dy)
+            current_index = next_index
+
+            if accumulated < self.lookahead_distance:
+                continue
+
+            tx = self.route[current_index, 0]
+            ty = self.route[current_index, 1]
+
+            dx = tx - x
+            dy = ty - y
+
+            # Transform target into the vehicle frame.
+            local_x = cos_yaw * dx + sin_yaw * dy
+
+            # Do not pursue a point behind the car.
+            if local_x > 0.05:
+                target_index = current_index
+                break
+
+        if target_index is None:
+            return None
+
+        # --------------------------------------------------------------
+        # 3. Transform the selected target into vehicle coordinates.
+        # --------------------------------------------------------------
+        target_x = self.route[target_index, 0]
+        target_y = self.route[target_index, 1]
+
+        dx = target_x - x
+        dy = target_y - y
+
+        local_x = cos_yaw * dx + sin_yaw * dy
+        local_y = -sin_yaw * dx + cos_yaw * dy
+
+        lookahead_sq = local_x * local_x + local_y * local_y
+
+        if lookahead_sq < 1e-6:
+            return None
+
+        # --------------------------------------------------------------
+        # 4. Standard Pure Pursuit curvature:
+        #
+        #        curvature = 2*y / L^2
+        #
+        #    Convert curvature to bicycle-model steering.
+        # --------------------------------------------------------------
+        curvature = 2.0 * local_y / lookahead_sq
+
+        steering = math.atan(
+            self.wheelbase * curvature
+        )
+
+        steering = float(np.clip(
+            steering,
+            -0.35,
+            0.35,
+        ))
+
+        # Conservative first test.
+        speed = self.pure_pursuit_speed
+
+        if self._marker_divisor == 0:
+            cross_track_error = math.sqrt(
+                float(dist_sq[nearest_index])
+            )
+
+            self.get_logger().info(
+                f'PP nearest={nearest_index}, '
+                f'target={target_index}, '
+                f'cte={cross_track_error:.2f}m, '
+                f'lookahead={math.sqrt(lookahead_sq):.2f}m, '
+                f'steer={math.degrees(steering):+.1f}deg, '
+                f'speed={speed:.2f}m/s'
+            )
+
+        return steering, speed
+    
+    def plan_gap(self, ranges, angles):
         """Decide what the car should do, given the latest scan.
 
         Returns `(steering, speed)`: a steering angle in radians, and a speed
@@ -169,6 +356,40 @@ class Driver(Node):
 
         gap_widths = gap_ends - gap_starts
         best_gap = np.argmax(gap_widths)
+
+        # Diagnostic: inspect all available gaps at the bottom-left route split.
+        if (
+            getattr(self, 'position', None) is not None
+            and self._marker_divisor == 0
+        ):
+            x, y = self.position
+
+            if x < -7.3 and 8.8 < y < 10.0:
+                gap_info = []
+
+                for i, (start, end, width) in enumerate(
+                    zip(gap_starts, gap_ends, gap_widths)
+                ):
+                    centre_index = (start + end - 1) // 2
+
+                    centre_deg = math.degrees(front_angles[centre_index])
+                    start_deg = math.degrees(front_angles[start])
+                    end_deg = math.degrees(front_angles[end - 1])
+
+                    chosen = "*" if i == best_gap else " "
+
+                    gap_info.append(
+                        f'{chosen}gap{i}: '
+                        f'w={int(width)}, '
+                        f'centre={centre_deg:+.1f}deg, '
+                        f'span=[{start_deg:+.1f},{end_deg:+.1f}]'
+                    )
+
+                self.get_logger().warn(
+                    f'FORK_SCAN x={x:.2f}, y={y:.2f}, '
+                    f'yaw={math.degrees(self.yaw):+.1f}deg | '
+                    + ' | '.join(gap_info)
+                )
 
         gap_start = gap_starts[best_gap]
         gap_end = gap_ends[best_gap]
