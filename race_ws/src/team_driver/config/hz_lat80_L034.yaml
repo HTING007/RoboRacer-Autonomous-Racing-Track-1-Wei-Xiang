@@ -1,0 +1,5 @@
+driver:
+  ros__parameters:
+    route_file: "icra26_shortest_clear45.csv"
+    a_lat_max: 8.0
+    lookahead_ratio: 0.34
