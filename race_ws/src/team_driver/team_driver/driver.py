@@ -61,52 +61,82 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 2.85)        # [m/s]
+        self.declare_parameter('crawl_speed', 2.85)        # [m/s] fallback crawl speed
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
-        self.declare_parameter('lookahead_distance', 0.9)   # [m]
         self.declare_parameter('wheelbase', 0.33)           # [m]
-        self.declare_parameter('pure_pursuit_speed', 2.8)   # [m/s]
+        self.declare_parameter('route_file', 'icra26_centerline.csv')
+        self.declare_parameter('lookahead_min', 1.00)       # [m] min lookahead in corners
+        self.declare_parameter('lookahead_max', 2.30)       # [m] max lookahead on straights
+        self.declare_parameter('lookahead_ratio', 0.32)     # L = lookahead_ratio * v + lookahead_min
+        self.declare_parameter('max_speed', 15.0)            # [m/s] top straight speed
+        self.declare_parameter('min_speed', 2.5)            # [m/s] minimum cornering speed
+        self.declare_parameter('a_lat_max', 7.2)            # [m/s^2] max lateral acceleration
+        self.declare_parameter('a_brake', 5.8)              # [m/s^2] braking deceleration limit
+        self.declare_parameter('a_accel', 5.0)              # [m/s^2] forward acceleration limit
+        self.declare_parameter('max_steer', 0.38)           # [rad] steering angle cap
+        self.declare_parameter('steering_rate_limit', 3.2)  # [rad/s] maximum steering slew rate
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
         self.max_range = self.get_parameter('max_range').value
-        self.lookahead_distance = self.get_parameter('lookahead_distance').value
         self.wheelbase = self.get_parameter('wheelbase').value
-        self.pure_pursuit_speed = self.get_parameter('pure_pursuit_speed').value
+        self.lookahead_min = float(self.get_parameter('lookahead_min').value)
+        self.lookahead_max = float(self.get_parameter('lookahead_max').value)
+        self.lookahead_ratio = float(self.get_parameter('lookahead_ratio').value)
+        self.max_speed = float(self.get_parameter('max_speed').value)
+        self.min_speed = float(self.get_parameter('min_speed').value)
+        self.a_lat_max = float(self.get_parameter('a_lat_max').value)
+        self.a_brake = float(self.get_parameter('a_brake').value)
+        self.a_accel = float(self.get_parameter('a_accel').value)
+        self.max_steer = float(self.get_parameter('max_steer').value)
+        self.steering_rate_limit = float(self.get_parameter('steering_rate_limit').value)
 
-        # Latest known pose and speed. Ground truth from the simulator, which
-        # the rules allow you to use - so use it.
+        # Latest known pose and speed from odometry
         self.position = None      # (x, y) in the map frame
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
 
-        # Load the map-derived shortest legal route installed with this package.
+        # Controller tracking state
+        self.prev_steering = 0.0
+        self.prev_nearest_idx = None
+
+        # Load route and precompute optimal curvature-bounded speed profile
         self.route = None
+        self.segment_lengths = None
+        self.speed_profile = None
+        self.curvatures = None
+
+        route_filename = self.get_parameter('route_file').value
+        package_share = get_package_share_directory('team_driver')
+        route_path = os.path.join(package_share, 'config', route_filename)
+
+        if not os.path.isfile(route_path):
+            fallback_path = os.path.join(package_share, 'config', 'icra26_shortest_clear45.csv')
+            if os.path.isfile(fallback_path):
+                route_path = fallback_path
 
         try:
-            package_share = get_package_share_directory('team_driver')
-            route_path = os.path.join(
-                package_share,
-                'config',
-                'icra26_shortest_clear45.csv',
-            )
-
             route = np.loadtxt(
                 route_path,
                 delimiter=',',
                 comments='#',
                 dtype=np.float64,
             )
-
             if route.ndim != 2 or route.shape[1] < 2:
                 raise ValueError('route CSV must contain x,y columns')
 
             self.route = route[:, :2]
+            self.segment_lengths = np.hypot(
+                np.diff(self.route[:, 0], append=self.route[0, 0]),
+                np.diff(self.route[:, 1], append=self.route[0, 1]),
+            )
+            self.speed_profile, self.curvatures = self.compute_speed_profile(self.route)
 
             self.get_logger().info(
-                f'Loaded Pure Pursuit route: '
-                f'{len(self.route)} points from {route_path}'
+                f'Loaded route: {len(self.route)} points from {route_path}. '
+                f'Speed profile: min={self.speed_profile.min():.2f}m/s, '
+                f'max={self.speed_profile.max():.2f}m/s, '
+                f'mean={self.speed_profile.mean():.2f}m/s'
             )
-
         except Exception as exc:
             self.get_logger().error(
                 f'Could not load Pure Pursuit route: {exc}. '
@@ -187,124 +217,187 @@ class Driver(Node):
         return self.plan_gap(ranges, angles)
 
 
-    def plan_pure_pursuit(self):
-        """Track the precomputed closed route using Pure Pursuit."""
+    def compute_speed_profile(self, route):
+        """Compute optimal curvature-bounded speed profile with forward/backward passes."""
+        n = len(route)
+        k = 3  # smoothing offset for curvature estimation
+        curvatures = np.zeros(n)
 
-        if self.position is None or self.route is None:
+        for i in range(n):
+            p_prev = route[(i - k) % n]
+            p_curr = route[i]
+            p_next = route[(i + k) % n]
+
+            a = float(np.hypot(*(p_curr - p_prev)))
+            b = float(np.hypot(*(p_next - p_curr)))
+            c = float(np.hypot(*(p_next - p_prev)))
+
+            area = 0.5 * abs(
+                (p_curr[0] - p_prev[0]) * (p_next[1] - p_prev[1])
+                - (p_curr[1] - p_prev[1]) * (p_next[0] - p_prev[0])
+            )
+            if a * b * c > 1e-6:
+                curvatures[i] = 4.0 * area / (a * b * c)
+            else:
+                curvatures[i] = 0.0
+
+        # Raw curvature-limited cornering speeds: v = sqrt(a_lat / kappa)
+        speeds = np.full(n, self.max_speed)
+        for i in range(n):
+            if curvatures[i] > 1e-3:
+                v_crit = math.sqrt(self.a_lat_max / curvatures[i])
+                speeds[i] = min(self.max_speed, max(self.min_speed, v_crit))
+
+        ds = np.hypot(
+            np.diff(route[:, 0], append=route[0, 0]),
+            np.diff(route[:, 1], append=route[0, 1]),
+        )
+
+        # Backward braking pass: ensure the car slows down BEFORE corners
+        for _ in range(2):
+            for i in range(n - 1, -1, -1):
+                next_i = (i + 1) % n
+                v_allowed = math.sqrt(speeds[next_i]**2 + 2.0 * self.a_brake * ds[i])
+                if speeds[i] > v_allowed:
+                    speeds[i] = v_allowed
+
+        # Forward acceleration pass: accelerate realistically out of turns
+        for _ in range(2):
+            for i in range(n):
+                next_i = (i + 1) % n
+                v_allowed = math.sqrt(speeds[i]**2 + 2.0 * self.a_accel * ds[i])
+                if speeds[next_i] > v_allowed:
+                    speeds[next_i] = v_allowed
+
+        return speeds, curvatures
+
+    def plan_pure_pursuit(self):
+        """Track the precomputed closed route using Adaptive Pure Pursuit."""
+        if self.position is None or self.route is None or self.speed_profile is None:
             return None
 
         x, y = self.position
         n = len(self.route)
-
         if n < 2:
             return None
 
         # --------------------------------------------------------------
-        # 1. Find the route point closest to the current car position.
+        # 1. Local search for closest route point (prevents track hopping)
         # --------------------------------------------------------------
-        dx_all = self.route[:, 0] - x
-        dy_all = self.route[:, 1] - y
-        dist_sq = dx_all * dx_all + dy_all * dy_all
+        if self.prev_nearest_idx is not None:
+            search_window = 40
+            indices = (self.prev_nearest_idx - 10 + np.arange(search_window)) % n
+            dx_w = self.route[indices, 0] - x
+            dy_w = self.route[indices, 1] - y
+            dist_sq_w = dx_w * dx_w + dy_w * dy_w
+            best_local = int(np.argmin(dist_sq_w))
+            nearest_index = int(indices[best_local])
+            cte_sq = float(dist_sq_w[best_local])
 
-        nearest_index = int(np.argmin(dist_sq))
+            # Global fallback if tracking was somehow lost (>2.5m error)
+            if cte_sq > 6.25:
+                dx_all = self.route[:, 0] - x
+                dy_all = self.route[:, 1] - y
+                dist_sq = dx_all * dx_all + dy_all * dy_all
+                nearest_index = int(np.argmin(dist_sq))
+                cte_sq = float(dist_sq[nearest_index])
+        else:
+            dx_all = self.route[:, 0] - x
+            dy_all = self.route[:, 1] - y
+            dist_sq = dx_all * dx_all + dy_all * dy_all
+            nearest_index = int(np.argmin(dist_sq))
+            cte_sq = float(dist_sq[nearest_index])
+
+        self.prev_nearest_idx = nearest_index
 
         # --------------------------------------------------------------
-        # 2. Walk forward along the route until the lookahead distance
-        #    has been reached.
-        #
-        #    The CSV is a closed loop, so wrap around at the end.
+        # 2. Dynamic Lookahead Distance (speed-dependent, stops zigzagging)
         # --------------------------------------------------------------
-        accumulated = 0.0
-        current_index = nearest_index
-        target_index = None
+        current_v = max(self.speed, 1.0)
+        local_curv = float(self.curvatures[nearest_index]) if self.curvatures is not None else 0.0
+        base_L = self.lookahead_ratio * current_v + self.lookahead_min
+        lookahead = float(np.clip(
+            base_L / (1.0 + 0.35 * local_curv),
+            self.lookahead_min,
+            self.lookahead_max,
+        ))
 
+        # --------------------------------------------------------------
+        # 3. Find lookahead point by path arc length (prevents track hopping)
+        # --------------------------------------------------------------
+        target_point = None
+        target_index = nearest_index
+        accum = 0.0
+        curr = nearest_index
+
+        for _ in range(n):
+            nxt = (curr + 1) % n
+            seg_len = float(self.segment_lengths[curr])
+            if accum + seg_len >= lookahead:
+                alpha = (lookahead - accum) / seg_len if seg_len > 1e-4 else 0.5
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                p_curr = self.route[curr]
+                p_next = self.route[nxt]
+                target_point = (1.0 - alpha) * p_curr + alpha * p_next
+                target_index = nxt
+                break
+            accum += seg_len
+            curr = nxt
+
+        if target_point is None:
+            fwd = (nearest_index + 5) % n
+            target_point = self.route[fwd]
+            target_index = fwd
+
+        # --------------------------------------------------------------
+        # 4. Transform target into vehicle coordinates
+        # --------------------------------------------------------------
         cos_yaw = math.cos(self.yaw)
         sin_yaw = math.sin(self.yaw)
 
-        for _ in range(n):
-            next_index = (current_index + 1) % n
-
-            segment_dx = (
-                self.route[next_index, 0]
-                - self.route[current_index, 0]
-            )
-            segment_dy = (
-                self.route[next_index, 1]
-                - self.route[current_index, 1]
-            )
-
-            accumulated += math.hypot(segment_dx, segment_dy)
-            current_index = next_index
-
-            if accumulated < self.lookahead_distance:
-                continue
-
-            tx = self.route[current_index, 0]
-            ty = self.route[current_index, 1]
-
-            dx = tx - x
-            dy = ty - y
-
-            # Transform target into the vehicle frame.
-            local_x = cos_yaw * dx + sin_yaw * dy
-
-            # Do not pursue a point behind the car.
-            if local_x > 0.05:
-                target_index = current_index
-                break
-
-        if target_index is None:
-            return None
-
-        # --------------------------------------------------------------
-        # 3. Transform the selected target into vehicle coordinates.
-        # --------------------------------------------------------------
-        target_x = self.route[target_index, 0]
-        target_y = self.route[target_index, 1]
-
-        dx = target_x - x
-        dy = target_y - y
-
+        dx = float(target_point[0] - x)
+        dy = float(target_point[1] - y)
         local_x = cos_yaw * dx + sin_yaw * dy
         local_y = -sin_yaw * dx + cos_yaw * dy
 
         lookahead_sq = local_x * local_x + local_y * local_y
-
         if lookahead_sq < 1e-6:
             return None
 
         # --------------------------------------------------------------
-        # 4. Standard Pure Pursuit curvature:
-        #
-        #        curvature = 2*y / L^2
-        #
-        #    Convert curvature to bicycle-model steering.
+        # 5. Pure Pursuit Curvature and Steering with Slew-Rate Limiting
         # --------------------------------------------------------------
         curvature = 2.0 * local_y / lookahead_sq
+        raw_steering = math.atan(self.wheelbase * curvature)
+        target_steering = float(np.clip(raw_steering, -self.max_steer, self.max_steer))
 
-        steering = math.atan(
-            self.wheelbase * curvature
-        )
-
+        # Steering slew-rate limiter: smooths out high-frequency jerking
+        dt = 0.025
+        max_delta_steer = self.steering_rate_limit * dt
         steering = float(np.clip(
-            steering,
-            -0.35,
-            0.35,
+            target_steering,
+            self.prev_steering - max_delta_steer,
+            self.prev_steering + max_delta_steer,
         ))
+        self.prev_steering = steering
 
-        # Conservative first test.
-        speed = self.pure_pursuit_speed
+        # --------------------------------------------------------------
+        # 6. Dynamic Speed Command from Speed Profile
+        # --------------------------------------------------------------
+        base_speed = min(self.speed_profile[nearest_index], self.speed_profile[target_index])
+
+        # Cross-track error damping: gently reduce speed if drifting wide
+        cte = math.sqrt(cte_sq)
+        if cte > 0.30:
+            speed_factor = float(np.clip(1.0 - 0.6 * (cte - 0.30), 0.65, 1.0))
+            speed = base_speed * speed_factor
+        else:
+            speed = base_speed
 
         if self._marker_divisor == 0:
-            cross_track_error = math.sqrt(
-                float(dist_sq[nearest_index])
-            )
-
             self.get_logger().info(
-                f'PP nearest={nearest_index}, '
-                f'target={target_index}, '
-                f'cte={cross_track_error:.2f}m, '
-                f'lookahead={math.sqrt(lookahead_sq):.2f}m, '
+                f'PP near={nearest_index}, tgt={target_index}, '
+                f'cte={cte:.2f}m, L={lookahead:.2f}m, '
                 f'steer={math.degrees(steering):+.1f}deg, '
                 f'speed={speed:.2f}m/s'
             )
