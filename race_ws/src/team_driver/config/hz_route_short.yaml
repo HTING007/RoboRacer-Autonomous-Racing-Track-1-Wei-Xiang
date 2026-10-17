@@ -1,0 +1,3 @@
+driver:
+  ros__parameters:
+    route_file: "icra26_shortest_clear45.csv"
