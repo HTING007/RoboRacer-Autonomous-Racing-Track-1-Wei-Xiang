@@ -67,7 +67,7 @@ The controller publishes speed and steering commands through `/drive`.
 
 Result file:
 
-`results/hz_lat86_L034__20261017T085642Z_r2.json`
+`results/submitted/hz_lat86_L034__20261017T085642Z_r2.json`
 
 - Status: COMPLETE
 - Laps completed: 10/10
@@ -86,7 +86,7 @@ We also changed the final parameters to the default submitted configuration and 
 
 Result file:
 
-`results/final_submission_test__20261018T151818Z.json`
+`results/submitted/final_submission_test__20261018T151818Z.json`
 
 - Status: COMPLETE
 - Laps completed: 10/10
