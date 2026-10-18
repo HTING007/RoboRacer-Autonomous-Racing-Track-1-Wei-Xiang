@@ -64,13 +64,13 @@ class Driver(Node):
         self.declare_parameter('crawl_speed', 2.85)        # [m/s] fallback crawl speed
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
         self.declare_parameter('wheelbase', 0.33)           # [m]
-        self.declare_parameter('route_file', 'icra26_centerline.csv')
+        self.declare_parameter('route_file', 'icra26_shortest_clear45.csv')
         self.declare_parameter('lookahead_min', 1.00)       # [m] min lookahead in corners
         self.declare_parameter('lookahead_max', 2.30)       # [m] max lookahead on straights
-        self.declare_parameter('lookahead_ratio', 0.32)     # L = lookahead_ratio * v + lookahead_min
+        self.declare_parameter('lookahead_ratio', 0.34)     # L = lookahead_ratio * v + lookahead_min
         self.declare_parameter('max_speed', 15.0)            # [m/s] top straight speed
         self.declare_parameter('min_speed', 2.5)            # [m/s] minimum cornering speed
-        self.declare_parameter('a_lat_max', 7.2)            # [m/s^2] max lateral acceleration
+        self.declare_parameter('a_lat_max', 8.6)            # [m/s^2] max lateral acceleration
         self.declare_parameter('a_brake', 5.8)              # [m/s^2] braking deceleration limit
         self.declare_parameter('a_accel', 5.0)              # [m/s^2] forward acceleration limit
         self.declare_parameter('max_steer', 0.38)           # [rad] steering angle cap

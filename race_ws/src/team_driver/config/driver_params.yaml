@@ -1,19 +1,5 @@
-# Your tuning lives here. Loaded with:
-#   ros2 run team_driver driver --ros-args --params-file \
-#       /hackathon/race_ws/src/team_driver/config/driver_params.yaml
-#
-# or in an evaluation run:
-#   ros2 launch roboracer_referee evaluate.launch.py team:=my_team \
-#       driver_params:=/hackathon/race_ws/src/team_driver/config/driver_params.yaml
-#
-# Keeping the numbers out of the code means you can sweep them without
-# rebuilding, which is the fastest way to find lap time early on. Declare a
-# parameter in driver.py and it can be set here.
-#
-# The two below are all the template needs, because the template does not
-# drive (see driver.py). Expect to replace them entirely.
-
 driver:
   ros__parameters:
-    crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
-    max_range: 8.0            # [m] clip the scan here
+    route_file: "icra26_shortest_clear45.csv"
+    a_lat_max: 8.6
+    lookahead_ratio: 0.34
