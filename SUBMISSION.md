@@ -4,10 +4,11 @@
 
 | Name | Matric Number | Email |
 | --- | --- | --- |
-| Wei Xiang | TO FILL | TO FILL |
-| Lee Jia Han | TO FILL | TO FILL |
-| Ting Hong Zhang | TO FILL | HTING007@e.ntu.edu.sg |
-| Other member(s) | TO FILL | TO FILL |
+| Wei Xiang | U2320480G | E230089@e.ntu.edu.sg |
+| Lee Jia Han | U2320360C | jlee342@e.ntu.edu.sg |
+| Ting Hong Zhang | U2520532K | HTING007@e.ntu.edu.sg |
+| Pua Ber Lin | U2520760E | PUAB0001@e.ntu.edu.sg |
+| Lim Chu Jun | U2520140E | e250002@e.ntu.edu.sg |
 
 ## Track
 
